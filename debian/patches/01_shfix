@@ -1,0 +1,12 @@
+# POSIX sh does not support source command
+--- a/apt-fast
++++ b/apt-fast
+@@ -7,7 +7,7 @@
+ ###################################################################
+ 
+ # Config File
+-source /etc/apt-fast.conf
++. /etc/apt-fast.conf
+ 
+ # Define lockfile
+ LCK_FILE=/var/run/$(basename $0).lock

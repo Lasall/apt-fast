@@ -1,0 +1,2 @@
+apt-fast /usr/sbin/
+apt-fast.conf /etc/
