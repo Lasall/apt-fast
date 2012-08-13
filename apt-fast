@@ -40,6 +40,9 @@ for arguments in $@; do
       [ "$arguments" == "build-dep" ]; then
     option="install"
     break
+  elif [ "$arguments" == "update" ]; then
+    option="update"
+    break
   elif [ "$arguments" == "clean" ] ||
       [ "$arguments" == "autoclean" ]; then
     option="clean"
@@ -160,6 +163,201 @@ get_uris(){
   apt-get -y --print-uris $@ | egrep -o -e "(ht|f)tp://[^\']+" > "$DLLIST"
 }
 
+# Move file to parent directory.
+move_plain(){
+  mv -- "$2" "../${2#./$1*}"
+}
+export -f move_plain
+
+# Helper function if update files are missing.
+warn_missing_files(){
+  # Drop missing translation files silently.
+  if echo "$1" | grep -qv "/Translation" 2>/dev/null; then
+    msg "W: File not found on local file system:" "warning"
+    msg "$1" "warning"
+  fi
+}
+
+# Copy, verify and extract local files for update command.
+local_update(){
+  local IFS=" "
+  # Copy files from local repositories.
+  # We have to try different compression types because apt-get --print-uri will
+  # only list .bz2 compression uris.
+  msg "\n Setup local files" "normal"
+  for uri in "${localfiles[@]}"; do
+    # Split URI and file name.
+    local fcp=( $uri )
+    if echo "${fcp[0]}" | grep -qv 'Release$'; then
+      # .bz2 or no compression
+      if [ -f "${fcp[0]}" ]; then
+        cp "${fcp[0]}" "APTFAST${fcp[1]}"
+
+      # .gz
+      elif [ -f "${fcp[0]%.*}.gz" ]; then
+        cp "${fcp[0]%.*}.gz" "APTFAST${fcp[1]}".gz
+
+      # stripped file extension / no compression
+      elif [ -f "${fcp[0]%.*}" ]; then
+        cp "${fcp[0]%.*}" "APTFAST${fcp[1]}"
+
+      else
+        #TODO: Add all missing files to array and display them not till
+        #      the end.
+        warn_missing_files "${fcp[0]}"
+      fi
+
+    elif [ -f "${fcp[0]%/*}/InRelease" ]; then
+      cp "${fcp[0]%/*}/InRelease" "APTFAST${fcp[1]%_*}_InRelease"
+      if [ -f "${fcp[0]%/*}/Release.gpg" ]; then
+        cp "${fcp[0]%/*}/Release.gpg" "APTFAST${fcp[1]%_*}_Release.gpg"
+      else
+        warn_missing_files "${fcp[0]%/*}/Release.gpg"
+      fi
+
+    elif [ -f "${fcp[0]%/*}/Release" ]; then
+      cp "${fcp[0]%/*}/Release" "APTFAST${fcp[1]%_*}_Release"
+
+    else
+      #TODO: See above.
+      warn_missing_files "${fcp[0]}"
+    fi
+  # Fork to background to enable parallel download.
+  done &
+  local WAITPID_LOC=$!
+  wait $WAITPID_LOC
+
+  # Verify signatures.
+  #TODO: Be more quiet.
+  msg "\n Verify local signatures..." "normal"
+  for file in APTFAST_*_InRelease; do
+    [ -f "$file" ] || continue
+    gpgv ${keyrings[@]} $file
+  done &
+  local WAITPID_REL=$!
+
+  # Verify checksums in Release file.
+  #TODO
+
+  # Unpack index archives and copy them to lists directory.
+  msg "\n Unpack local archives..." "normal"
+  for file in APTFAST_*.bz2; do
+    [ -f "$file" ] || continue
+    local tmpname="${file%*.bz2}"
+    echo $tmpname
+    bunzip2 -cf "$file" > "../${tmpname#APTFAST*}" && rm -f -- "$file"
+  done &
+  local WAITPID_BZ2=$!
+
+  for file in APTFAST_*.gz; do
+    [ -f "$file" ] || continue
+    local tmpname="${file%*.gz}"
+    gunzip -cnf "$file" > "../${tmpname#APTFAST*}" && rm -f -- "$file"
+  done &
+  local WAITPID_GZ=$!
+
+  wait $WAITPID_REL
+  msg "\n Install local remaining files..." "normal"
+  find -maxdepth 1 -type f \
+    -regex '^./APTFAST_.+\(Release\.gpg\|InRelease\|Release\|Packages\|Sources\)$' \
+    -execdir bash -c 'move_plain "APTFAST" "{}"' \; &
+  local WAITPID_PLAIN=$!
+
+  wait $WAITPID_BZ2
+  wait $WAITPID_GZ
+  wait $WAITPID_PLAIN
+  msg "\n Local files up to date." "normal"
+}
+
+# Download, verify and extract external files for update command.
+external_update(){
+  local IFS=" "
+  # Setup aria2c download list and download files.
+  msg "\n Setup external files..." "normal"
+  [ -f "$DLLIST" ] && rm -f -- "$DLLIST"
+  for uri in "${exturis[@]}"; do
+    local fcp=( $uri )
+    if echo "${fcp[0]}" | grep -qv 'Release$'; then
+      # Instead of checking avaibility of files we let aria decide by passing
+      # alternatives.
+      # Here we hope that aria will do not mess up with different compression
+      # types if those (.bz2, .gz and plain) exist.
+      # If you read this comment and do not encounter errors, take a few
+      # minutes and thank aria for that great feature.
+      # At this point we don't know the filetype so we set EX element to
+      # file name (same with Release file because we don't know if sigend
+      # or unsigned Release file was downloaded).
+      echo -e "${fcp[0]%.*}.bz2\t${fcp[0]%.*}.gz\t${fcp[0]%.*}\n out=APTFAST-EX${fcp[1]}" >> "$DLLIST"
+
+    else
+      echo -e "${fcp[0]%/*}/InRelease\t${fcp[0]%/*}/Release\n out=APTFAST-EX${fcp[1]%_*}_Release" >> "$DLLIST"
+      # Try to download .gpg file.
+      echo -e "${fcp[0]%/*}/Release.gpg\n out=APTFAST-EX${fcp[1]%_*}_Release.gpg" >> "$DLLIST"
+    fi
+  done
+  eval "${_DOWNLOADER}" &
+  local WAITPID_EXT=$!
+  wait $WAITPID_EXT
+
+  # Rename file (extensions) according to file type.
+  #NOTE: File names are friendly so we can work with shell expansions (which is
+  #      faster than find).
+  #FIXME: This is a bottle neck.
+  msg "\n Setup external file types..." "normal"
+  for file in APTFAST-EX*; do
+    [ -f "$file" ] || continue
+    local ftype="$(file -b "$file")"
+    if echo "$ftype" | grep -q '^bzip2'; then
+      mv -- "$file" "${file%*.}.bz2"
+    elif echo "$ftype" | grep -q '^gzip'; then
+      mv -- "$file" "${file%*.}.gz"
+    elif echo "$file" | grep -q '_Release$' &&
+      grep -qm 1 -- "-----BEGIN PGP SIGNED MESSAGE-----" "$file"; then
+      mv -- "$file" "${file%*Release}InRelease"
+    fi
+  done
+
+  # Verify signatures.
+  #TODO: Be more quiet.
+  msg "\n Verify external signatures..." "normal"
+  for file in APTFAST-EX*_InRelease; do
+    [ -f "$file" ] || continue
+    gpgv ${keyrings[@]} $file
+  done &
+  local WAITPID_REL=$!
+
+  # Verify checksums in Release file.
+  #TODO
+
+  # Unpack index archives.
+  msg "\n Unpack external archives..." "normal"
+  for file in APTFAST-EX*.bz2; do
+    [ -f "$file" ] || continue
+    local tmpname="${file%*.bz2}"
+    bunzip2 -cf "$file" > "../${tmpname#APTFAST-EX*}" && rm -f -- "$file"
+  done &
+  local WAITPID_BZ2=$!
+
+  for file in APTFAST-EX*.gz; do
+    [ -f "$file" ] || continue
+    local tmpname="${file%*.gz}"
+    gunzip -cnf "$file" > "../${tmpname#APTFAST-EX*}" && rm -f -- "$file"
+  done &
+  local WAITPID_GZ=$!
+
+  wait $WAITPID_REL
+  msg "\n Install external remaining files..." "normal"
+  find -maxdepth 1 -type f \
+    -regex '^./APTFAST-EX.+\(Release\.gpg\|InRelease\|Release\|Packages\|Sources\)$' \
+    -execdir bash -c 'move_plain "APTFAST-EX" "{}"' \; &
+  local WAITPID_PLAIN=$!
+
+  wait $WAITPID_BZ2
+  wait $WAITPID_GZ
+  wait $WAITPID_PLAIN
+  msg "\n External files up to date." "normal"
+}
+
 # Create and insert a PID number to lockfile.
 lockfile-create "$LCK_FILE"
 lockfile-touch "$LCK_FILE" &
@@ -251,6 +449,42 @@ if [ "$option" == "install" ]; then
   #FIXME: quotes get lost: apt-fast install "foo*" -> apt-get install foo*
   "${_APTMGR}" $@ &
   APTPID=$!
+
+elif [ "$option" == "update" ] && [ ! "$LEGACY" ]; then
+  [ ! -d "$LISTDIR/partial" ] && mkdir -p -- "$LISTDIR/partial"
+  cd -- "$LISTDIR/partial" &>/dev/null || LCK_RM_1
+
+  # Clean up old files to dismiss deprecated package lists.
+  #NOTE: If interrupted package cache is garbage (not complete).
+  find ../ -maxdepth 1 -type f -delete
+
+  # Copy local files first because aria2c has no support to download local
+  # files, see aria issue with id 3094269.
+
+  # It is faster to call apt-get --print-uris twice than save it to array and
+  # perform actions with array.
+  IFS=$'\n'
+  exturis=( $(apt-get -y --print-uris $@ |
+    sed -e "/^'file:/d" \
+        -e "s/'\(.\+\)'[ \t]\+\([^ \t]\+\).*/\1 \2/") ) || LCK_RM_1
+  localfiles=( $(apt-get -y --print-uris $@ |
+    sed -n "s/^'file:\(.\+\)'[ \t]\+\([^ \t]\+\).*/\1 \2/p") )
+
+  eval $(apt-config shell etcdir Dir::Etc)
+  eval $(apt-config shell keyring Dir::Etc::trusted)
+  eval $(apt-config shell keyringdir Dir::Etc::trustedparts)
+  keyrings=( "--keyring ${rootdir}${etcdir}${keyring}"
+    $(find "${rootdir}${etcdir}${keyringdir}" -maxdepth 1 -type f -name '*.gpg' -printf "--keyring %p\n") )
+
+  local_update &
+  WAITPID_LOCUPDATE=$!
+  external_update &
+  WAITPID_EXTUPDATE=$!
+  wait $WAITPID_LOCUPDATE
+  wait $WAITPID_EXTUPDATE
+
+  # Cleanup remaining files.
+  find -maxdepth 1 -type f -name 'APTFAST*' -delete
 
 
 elif [ "$option" == "clean" ]; then
